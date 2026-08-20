@@ -19,6 +19,11 @@ Quien no quiera utilizar Python ni la línea de comandos puede usar la [aplicaci
 - Informa nombres de partes, tempo, idioma, divisi, grupos irregulares y notas que podrían sonar con «ah».
 - No modifica automáticamente una letra cuando el resultado es ambiguo.
 - Ofrece un flujo bilingüe optativo con vista previa editable y confirmación individual.
+- Reconoce indicaciones «swing» o «con swing» y escribe 4/4 como 12/8 y 2/4 como 6/8.
+- Si no hay tempo, agrega negra = 100 en compás simple o negra con puntillo = 100 en compuesto.
+- Revisa los silencios invisibles que suelen quedar después de Audiveris/MuseScore: elimina sólo los que sobran con certeza y vuelve visibles los que completan el compás.
+- Normaliza soprano, alto, tenor y bajo como instrumentos vocales para evitar que Sibelius interprete las voces graves como instrumentos transpositores.
+- Comprueba las claves de tenor y bajo. Si una clave de tenor con 8 hace que sus alturas MusicXML queden por debajo del bajo, sube los `<pitch>` del tenor una octava; los casos no demostrables sólo se informan.
 
 Una sinalefa une en una sola emisión vocal la vocal final de una palabra y la vocal inicial de la siguiente. En este flujo, el guion bajo dentro de la letra —por ejemplo, `y_al`— representa explícitamente esa unión para Cantamus.
 
@@ -57,6 +62,8 @@ El script crea dos archivos:
 
 Si se omite `--report`, el informe se guarda junto a la salida con el sufijo `-report.md`.
 
+El reconocimiento de swing y las correcciones seguras de silencios invisibles están activos de manera predeterminada. Para hacer solamente una auditoría sin esas transformaciones se pueden agregar `--no-swing` o `--no-ghost-fixes`. Algunos exportadores muestran «con swing» en la partitura pero omiten ese texto del MusicXML; en esos casos se usa `--force-swing` después de comprobar la indicación en la fuente.
+
 ## Partituras bilingües
 
 Cantamus utiliza un solo idioma de voz por partitura. Cuando una obra combina, por ejemplo, español e inglés, el preparador puede proponer una escritura fonética aproximada del inglés para una voz configurada en español. Esta función es optativa: primero genera una vista previa y no cambia ninguna sílaba hasta que cada reemplazo haya sido confirmado.
@@ -94,7 +101,7 @@ Antes de modificar cada sílaba, el script verifica parte, compás, nota, verso 
 
 El script despliega repeticiones secuenciales simples y casillas numeradas. Si encuentra navegación mediante D.C., D.S. o Coda, letras incompatibles con las pasadas disponibles o una estructura circular, se detiene para evitar inventar música o texto.
 
-Antes de subir el resultado a Cantamus, conviene abrirlo en MuseScore u otro editor compatible, reproducirlo completo y revisar especialmente las sinalefas, los melismas y las notas sin letra.
+Antes de subir el resultado a Cantamus, conviene abrirlo en MuseScore u otro editor compatible, reproducirlo completo y revisar especialmente las sinalefas, los melismas, las notas sin letra y cualquier advertencia de octava. El preparador nunca cambia automáticamente la altura de tenor o bajo cuando la clave y la tesitura no permiten demostrar la corrección.
 
 ## Fuentes de referencia
 

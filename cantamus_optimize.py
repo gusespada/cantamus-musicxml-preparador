@@ -74,6 +74,13 @@ class TransformStats:
     phonetic_candidates: int = 0
     phonetic_converted: int = 0
     phonetic_unresolved: int = 0
+    swing_measures_converted: int = 0
+    default_tempo_added: bool = False
+    ghost_rests_removed: int = 0
+    hidden_rests_revealed: int = 0
+    vocal_parts_normalized: int = 0
+    tenor_octaves_repaired: int = 0
+    dangling_ties_removed: int = 0
 
 
 def parse_args() -> argparse.Namespace:
@@ -104,6 +111,21 @@ def parse_args() -> argparse.Namespace:
         "--apply-phonetics",
         type=Path,
         help="Apply only rows marked confirmed=yes in a previously reviewed CSV",
+    )
+    parser.add_argument(
+        "--no-swing",
+        action="store_true",
+        help="Do not convert 4/4 or 2/4 passages explicitly marked swing",
+    )
+    parser.add_argument(
+        "--force-swing",
+        action="store_true",
+        help="Convert eligible 4/4 and 2/4 passages even if the XML omitted the swing text",
+    )
+    parser.add_argument(
+        "--no-ghost-fixes",
+        action="store_true",
+        help="Report Audiveris/MuseScore hidden rests without applying safe fixes",
     )
     return parser.parse_args()
 
@@ -690,6 +712,471 @@ def analyze_elisions(
     }
 
 
+SWING_METERS = {(4, 4): (12, 8), (2, 4): (6, 8)}
+
+
+def _swing_values(divisions: int) -> tuple[tuple[int, str, int], ...]:
+    if divisions % 4:
+        raise ValueError("Swing conversion needs divisions divisible by four")
+    values = (
+        (divisions * 6, "whole", 1),
+        (divisions * 3, "half", 1),
+        (divisions * 2, "half", 0),
+        (divisions * 3 // 2, "quarter", 1),
+        (divisions, "quarter", 0),
+        (divisions * 3 // 4, "eighth", 1),
+        (divisions // 2, "eighth", 0),
+        (divisions * 3 // 8, "16th", 1),
+        (divisions // 4, "16th", 0),
+        (divisions * 3 // 16, "32nd", 1),
+        (divisions // 8, "32nd", 0),
+        (divisions * 3 // 32, "64th", 1),
+        (divisions // 16, "64th", 0),
+        (divisions * 3 // 64, "128th", 1),
+        (divisions // 32, "128th", 0),
+    )
+    return tuple(value for value in values if value[0] > 0)
+
+
+def _swing_position(position: int, divisions: int) -> int:
+    quarter, remainder = divmod(position, divisions)
+    half = divisions // 2
+    mapped = remainder * 2 if remainder <= half else divisions + remainder - half
+    return quarter * divisions * 3 // 2 + mapped
+
+
+def _decompose_swing_duration(
+    duration: int, values: tuple[tuple[int, str, int], ...]
+) -> list[tuple[int, str, int]]:
+    result: list[tuple[int, str, int]] = []
+    for value in values:
+        while duration >= value[0]:
+            result.append(value)
+            duration -= value[0]
+    if duration:
+        raise ValueError(f"Swing duration {duration} cannot be written exactly")
+    return result
+
+
+def _set_note_value(note: ET.Element, value: tuple[int, str, int]) -> None:
+    duration, note_type, dots = value
+    duration_node = note.find("duration")
+    if duration_node is not None:
+        duration_node.text = str(duration)
+    type_node = note.find("type")
+    if type_node is None:
+        return
+    type_node.text = note_type
+    for dot in list(note.findall("dot")):
+        note.remove(dot)
+    index = list(note).index(type_node) + 1
+    for _ in range(dots):
+        note.insert(index, ET.Element("dot"))
+        index += 1
+
+
+def _has_tie(note: ET.Element, kind: str) -> bool:
+    return any(tie.get("type") == kind for tie in note.findall("tie"))
+
+
+def _remove_tie(note: ET.Element, kind: str) -> None:
+    for tie in list(note.findall("tie")):
+        if tie.get("type") == kind:
+            note.remove(tie)
+    for notations in note.findall("notations"):
+        for tied in list(notations.findall("tied")):
+            if tied.get("type") == kind:
+                notations.remove(tied)
+
+
+def _add_tie(note: ET.Element, kind: str) -> None:
+    duration = note.find("duration")
+    if duration is not None and not _has_tie(note, kind):
+        note.insert(list(note).index(duration) + 1, ET.Element("tie", {"type": kind}))
+    notations = note.find("notations")
+    if notations is None:
+        notations = ET.SubElement(note, "notations")
+    if not any(tied.get("type") == kind for tied in notations.findall("tied")):
+        notations.append(ET.Element("tied", {"type": kind}))
+
+
+def _swing_continuation(note: ET.Element, value: tuple[int, str, int]) -> ET.Element:
+    result = copy.deepcopy(note)
+    for tag in ("lyric", "accidental", "tie", "notations"):
+        for item in list(result.findall(tag)):
+            result.remove(item)
+    _set_note_value(result, value)
+    return result
+
+
+def _convert_swing_measure(measure: ET.Element, divisions: int) -> None:
+    values = _swing_values(divisions)
+    items = list(measure)
+    index = 0
+    cursor = 0
+    while index < len(items):
+        item = items[index]
+        if item.tag in {"backup", "forward"}:
+            duration = item.find("duration")
+            if duration is not None:
+                old = int(duration.text or "0")
+                if item.tag == "backup":
+                    duration.text = str(
+                        _swing_position(cursor, divisions)
+                        - _swing_position(cursor - old, divisions)
+                    )
+                    cursor -= old
+                else:
+                    duration.text = str(
+                        _swing_position(cursor + old, divisions)
+                        - _swing_position(cursor, divisions)
+                    )
+                    cursor += old
+            index += 1
+            continue
+        if item.tag != "note" or item.find("chord") is not None:
+            index += 1
+            continue
+        chord = [item]
+        next_index = index + 1
+        while (
+            next_index < len(items)
+            and items[next_index].tag == "note"
+            and items[next_index].find("chord") is not None
+        ):
+            chord.append(items[next_index])
+            next_index += 1
+        duration = item.find("duration")
+        if duration is None:
+            index = next_index
+            continue
+        old = int(duration.text or "0")
+        rhythm = _decompose_swing_duration(
+            _swing_position(cursor + old, divisions) - _swing_position(cursor, divisions),
+            values,
+        )
+        copies: list[list[ET.Element]] = []
+        for chord_note in chord:
+            original_start = _has_tie(chord_note, "start")
+            _set_note_value(chord_note, rhythm[0])
+            if len(rhythm) > 1 and chord_note.find("rest") is None:
+                _remove_tie(chord_note, "start")
+                _add_tie(chord_note, "start")
+            fragments = [_swing_continuation(chord_note, value) for value in rhythm[1:]]
+            for fragment_index, fragment in enumerate(fragments):
+                if fragment.find("rest") is not None:
+                    continue
+                _add_tie(fragment, "stop")
+                if fragment_index < len(fragments) - 1 or original_start:
+                    _add_tie(fragment, "start")
+            copies.append(fragments)
+        if any(copies):
+            insertion = list(measure).index(chord[-1]) + 1
+            for fragment_index in range(max(map(len, copies))):
+                for fragments in copies:
+                    if fragment_index < len(fragments):
+                        measure.insert(insertion, fragments[fragment_index])
+                        insertion += 1
+            items = list(measure)
+            next_index += sum(map(len, copies))
+        cursor += old
+        index = next_index
+
+
+def convert_marked_swing(root: ET.Element, *, force: bool = False) -> int:
+    """Convert explicitly marked binary swing passages to written compound meter."""
+    trigger = re.compile(r"\b(?:con\s+)?swing\b", re.IGNORECASE)
+    trigger_indexes = [
+        index
+        for part in root.findall("part")
+        for index, measure in enumerate(part.findall("measure"))
+        if any(
+            trigger.search(words.text or "")
+            for words in measure.findall("direction/direction-type/words")
+        )
+    ]
+    if force:
+        trigger_indexes.append(0)
+    if not trigger_indexes:
+        return 0
+    first_trigger = min(trigger_indexes)
+    converted = 0
+    for part_index, part in enumerate(root.findall("part")):
+        meter: tuple[int, int] | None = None
+        divisions: int | None = None
+        for measure_index, measure in enumerate(part.findall("measure")):
+            attributes = measure.find("attributes")
+            if attributes is not None:
+                divisions_node = attributes.find("divisions")
+                if divisions_node is not None:
+                    divisions = int(divisions_node.text or "0")
+                time = attributes.find("time")
+                if time is not None:
+                    meter = (
+                        int(time.findtext("beats", "0")),
+                        int(time.findtext("beat-type", "0")),
+                    )
+            if measure_index < first_trigger or meter not in SWING_METERS:
+                continue
+            if not divisions:
+                raise ValueError("Cannot convert swing before MusicXML divisions are defined")
+            if divisions % 4:
+                factor = 2
+                for duration in measure.findall(".//duration"):
+                    duration.text = str(int(duration.text or "0") * factor)
+                if attributes is not None and attributes.find("divisions") is not None:
+                    attributes.find("divisions").text = str(divisions * factor)
+                divisions *= factor
+            _convert_swing_measure(measure, divisions)
+            for direction in list(measure.findall("direction")):
+                words = direction.find("direction-type/words")
+                if words is not None and trigger.search(words.text or ""):
+                    measure.remove(direction)
+                    continue
+                metronome = direction.find("direction-type/metronome")
+                if (
+                    metronome is not None
+                    and metronome.findtext("beat-unit") == "quarter"
+                    and metronome.find("beat-unit-dot") is None
+                ):
+                    beat = metronome.find("beat-unit")
+                    metronome.insert(
+                        list(metronome).index(beat) + 1,
+                        ET.Element("beat-unit-dot"),
+                    )
+                    sound = direction.find("sound")
+                    if sound is not None and sound.get("tempo"):
+                        sound.set(
+                            "tempo",
+                            str(float(sound.get("tempo", "0")) * 1.5).rstrip("0").rstrip("."),
+                        )
+                offset = direction.find("offset")
+                if offset is not None:
+                    offset.text = str(_swing_position(int(offset.text or "0"), divisions))
+            if attributes is not None and attributes.find("time") is not None:
+                target = SWING_METERS[meter]
+                attributes.find("time/beats").text = str(target[0])
+                attributes.find("time/beat-type").text = str(target[1])
+            if part_index == 0:
+                converted += 1
+    return converted
+
+
+def initial_meter(root: ET.Element) -> tuple[int, int] | None:
+    time = root.find("part/measure/attributes/time")
+    if time is None:
+        time = root.find("part/measure/time")
+    if time is None:
+        return None
+    return int(time.findtext("beats", "0")), int(time.findtext("beat-type", "0"))
+
+
+def ensure_initial_tempo(root: ET.Element, bpm: int = 100) -> bool:
+    """Add quarter=100, or dotted-quarter=100 for compound meters, if absent."""
+    if first_tempo(root) is not None:
+        return False
+    first_measure = root.find("part/measure")
+    if first_measure is None:
+        raise ValueError("Cannot add tempo: first measure not found")
+    compound = (initial_meter(root) or (0, 0)) in {(6, 8), (9, 8), (12, 8)}
+    direction = ET.Element("direction", {"placement": "above"})
+    direction_type = ET.SubElement(direction, "direction-type")
+    metronome = ET.SubElement(direction_type, "metronome", {"parentheses": "no"})
+    ET.SubElement(metronome, "beat-unit").text = "quarter"
+    if compound:
+        ET.SubElement(metronome, "beat-unit-dot")
+    ET.SubElement(metronome, "per-minute").text = str(bpm)
+    ET.SubElement(direction, "sound", {"tempo": str(bpm * 1.5 if compound else bpm)})
+    insertion = 1 if first_measure.find("attributes") is not None else 0
+    first_measure.insert(insertion, direction)
+    return True
+
+
+def hidden_rest_issues(root: ET.Element) -> list[str]:
+    names = part_name_map(root)
+    return [
+        f"{names.get(part.get('id', ''), part.get('id', '?'))} m.{measure.get('number', '?')}"
+        for part in root.findall("part")
+        for measure in part.findall("measure")
+        for note in measure.findall("note")
+        if note.find("rest") is not None and note.get("print-object") == "no"
+    ]
+
+
+def repair_hidden_rests(root: ET.Element) -> tuple[int, int]:
+    """Remove only provably extra hidden rests; reveal required ones."""
+    removed = 0
+    revealed = 0
+    for part in root.findall("part"):
+        state: dict[str, int] = {}
+        for measure in part.findall("measure"):
+            expected = measure_length(measure, state)
+            if expected is None:
+                continue
+            durations = note_duration_by_voice(measure)
+            for note in list(measure.findall("note")):
+                if note.find("rest") is None or note.get("print-object") != "no":
+                    continue
+                voice = note.findtext("voice", "1")
+                duration = int(note.findtext("duration", "0"))
+                if durations[voice] - duration == expected:
+                    measure.remove(note)
+                    durations[voice] -= duration
+                    removed += 1
+                else:
+                    note.attrib.pop("print-object", None)
+                    revealed += 1
+    return removed, revealed
+
+
+def normalize_vocal_parts(root: ET.Element) -> int:
+    """Give Sibelius/Cantamus canonical vocal identities without transposing notes."""
+    canonical = {
+        "bajo": ("Bass", "voice.bass"),
+        "bass": ("Bass", "voice.bass"),
+        "baritone": ("Baritone", "voice.baritone"),
+        "barítono": ("Baritone", "voice.baritone"),
+    }
+    changed = 0
+    for score_part in root.findall("part-list/score-part"):
+        visible = score_part.findtext("part-name", "").strip()
+        key = re.sub(r"\s*\(\d+\)\s*$", "", visible).casefold()
+        if key not in canonical:
+            continue
+        english, sound_name = canonical[key]
+        part_name = score_part.find("part-name")
+        if part_name is not None and part_name.text != english:
+            display = score_part.find("part-name-display")
+            if display is None:
+                display = ET.Element("part-name-display")
+                display.append(ET.Element("display-text"))
+                display.find("display-text").text = visible
+                score_part.insert(list(score_part).index(part_name) + 1, display)
+            part_name.text = english
+            part_name.attrib.pop("print-object", None)
+            changed += 1
+        for score_instrument in score_part.findall("score-instrument"):
+            instrument_sound = score_instrument.find("instrument-sound")
+            if instrument_sound is None:
+                instrument_sound = ET.SubElement(score_instrument, "instrument-sound")
+            if instrument_sound.text != sound_name:
+                instrument_sound.text = sound_name
+                changed += 1
+    return changed
+
+
+def _part_midi_values(part: ET.Element) -> list[int]:
+    steps = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
+    values: list[int] = []
+    for pitch in part.findall(".//pitch"):
+        step = pitch.findtext("step", "")
+        octave = pitch.findtext("octave")
+        if step not in steps or octave is None:
+            continue
+        alter = int(float(pitch.findtext("alter", "0")))
+        values.append((int(octave) + 1) * 12 + steps[step] + alter)
+    return values
+
+
+def repair_tenor_octave(root: ET.Element) -> int:
+    """Raise mis-exported tenor pitches when G8 plus pitch data sounds below bass."""
+    names = part_name_map(root)
+    tenor: ET.Element | None = None
+    bass: ET.Element | None = None
+    for part in root.findall("part"):
+        name = names.get(part.get("id", ""), "").casefold()
+        if name == "tenor":
+            tenor = part
+        elif name in {"bass", "bajo", "bajos"}:
+            bass = part
+    if tenor is None or bass is None:
+        return 0
+    has_g8 = any(
+        clef.findtext("sign") == "G"
+        and clef.findtext("line") == "2"
+        and clef.findtext("clef-octave-change") == "-1"
+        for clef in tenor.findall("measure/attributes/clef")
+    )
+    tenor_values = sorted(_part_midi_values(tenor))
+    bass_values = sorted(_part_midi_values(bass))
+    if not has_g8 or not tenor_values or not bass_values:
+        return 0
+    tenor_written_median = tenor_values[len(tenor_values) // 2]
+    bass_median = bass_values[len(bass_values) // 2]
+    tenor_sounding_median = tenor_written_median - 12
+    if tenor_sounding_median > bass_median:
+        return 0
+    repaired = 0
+    for octave in tenor.findall(".//pitch/octave"):
+        octave.text = str(int(octave.text or "0") + 1)
+        repaired += 1
+    return repaired
+
+
+def _remove_tie_kind(note: ET.Element, kind: str) -> None:
+    for tie in list(note.findall("tie")):
+        if tie.get("type") == kind:
+            note.remove(tie)
+    for notations in note.findall("notations"):
+        for tied in list(notations.findall("tied")):
+            if tied.get("type") == kind:
+                notations.remove(tied)
+
+
+def repair_dangling_ties(root: ET.Element) -> int:
+    """Remove tie ends left unmatched when repeat unfolding changes adjacency."""
+    repaired = 0
+    for part in root.findall("part"):
+        open_starts: dict[tuple[str, str, str, str], list[ET.Element]] = defaultdict(list)
+        for measure in part.findall("measure"):
+            for note in measure.findall("note"):
+                if note.find("pitch") is None:
+                    continue
+                key = (
+                    note.findtext("voice", "1"),
+                    note.findtext("pitch/step", ""),
+                    note.findtext("pitch/alter", "0"),
+                    note.findtext("pitch/octave", ""),
+                )
+                kinds = [tie.get("type", "") for tie in note.findall("tie")]
+                if "stop" in kinds:
+                    if open_starts[key]:
+                        open_starts[key].pop()
+                    else:
+                        _remove_tie_kind(note, "stop")
+                        repaired += 1
+                if "start" in kinds:
+                    open_starts[key].append(note)
+        for starts in open_starts.values():
+            for note in starts:
+                _remove_tie_kind(note, "start")
+                repaired += 1
+    return repaired
+
+
+def vocal_octave_warnings(root: ET.Element) -> list[str]:
+    """Report suspicious tenor/bass clefs and sounding ranges; never guess a transpose."""
+    names = part_name_map(root)
+    warnings: list[str] = []
+    for part in root.findall("part"):
+        name = names.get(part.get("id", ""), "").casefold()
+        if name not in {"tenor", "bass", "bajo", "bajos"}:
+            continue
+        clefs = part.findall("measure/attributes/clef")
+        if name == "tenor" and not any(
+            clef.findtext("sign") == "G"
+            and clef.findtext("line") == "2"
+            and clef.findtext("clef-octave-change") == "-1"
+            for clef in clefs
+        ):
+            warnings.append("Tenor: no se encontró clave de sol con 8 inferior; revisar octava")
+        if name in {"bass", "bajo", "bajos"} and not any(
+            clef.findtext("sign") == "F" for clef in clefs
+        ):
+            warnings.append("Bajo: no se encontró clave de fa; revisar instrumento y octava")
+    return warnings
+
+
 def measure_length(measure: ET.Element, state: dict[str, int]) -> int | None:
     attributes = measure.find("attributes")
     if attributes is not None:
@@ -799,10 +1286,12 @@ def first_tempo(root: ET.Element) -> tuple[float, str] | None:
         beat_unit = metronome.findtext("beat-unit")
         if per_minute and beat_unit in BEAT_UNIT_QUARTERS:
             bpm = float(per_minute)
-            if metronome.find("beat-unit-dot") is not None:
+            dotted = metronome.find("beat-unit-dot") is not None
+            if dotted:
                 bpm *= 1.5
             quarter_bpm = bpm * BEAT_UNIT_QUARTERS[beat_unit]
-            return quarter_bpm, f"{beat_unit}={per_minute}"
+            label = f"dotted-{beat_unit}" if dotted else beat_unit
+            return quarter_bpm, f"{label}={per_minute}"
     for sound in root.findall(".//sound"):
         if sound.get("tempo"):
             return float(sound.get("tempo", "120")), f"quarter={sound.get('tempo')}"
@@ -898,6 +1387,8 @@ def audit(root: ET.Element) -> dict[str, object]:
         "incomplete_divisi_voices": incomplete_voices,
         "duration_seconds": duration_seconds,
         "voice_minutes": voice_minutes,
+        "hidden_rests": hidden_rest_issues(root),
+        "vocal_octave_warnings": vocal_octave_warnings(root),
         **elisions,
         "numbered_stanza_prefixes": sum(
             1
@@ -952,6 +1443,13 @@ def write_report(
         f"- Prefijos de estrofa retirados (por ejemplo, `2.`): {stats.stanza_prefixes_removed}.",
         f"- Reemplazos fonéticos confirmados: {stats.phonetic_converted}.",
         f"- Candidatos fonéticos sin resolver o con estructura ambigua: {stats.phonetic_unresolved}.",
+        f"- Compases convertidos de swing binario a compuesto: {stats.swing_measures_converted}.",
+        f"- Tempo predeterminado agregado: {'sí' if stats.default_tempo_added else 'no'}.",
+        f"- Silencios fantasma comprobablemente sobrantes eliminados: {stats.ghost_rests_removed}.",
+        f"- Silencios invisibles necesarios convertidos en visibles: {stats.hidden_rests_revealed}.",
+        f"- Identificadores de voces normalizados: {stats.vocal_parts_normalized}.",
+        f"- Alturas de tenor corregidas una octava: {stats.tenor_octaves_repaired}.",
+        f"- Extremos de ligadura sin pareja eliminados: {stats.dangling_ties_removed}.",
         "- Los guiones bajos se conservaron: Cantamus los admite como elisión.",
         "",
         "## Comprobación contra la guía",
@@ -970,6 +1468,10 @@ def write_report(
         + ", ".join(row["name"] for row in after_parts)
         + " |",
         f"| Tempo interpretable | {status(after['tempo_without_bpm'] == 0)} | {after['tempo']} |",
+        f"| Sin silencios invisibles de Audiveris | {status(not after['hidden_rests'])} | "
+        f"{len(after['hidden_rests'])} restantes |",
+        f"| Octavas de tenor y bajo plausibles | {status(not after['vocal_octave_warnings'])} | "
+        f"{len(after['vocal_octave_warnings'])} advertencias |",
         f"| Cambios de compás al inicio de compás | {status(not after['time_changes_mid_measure'])} | "
         f"{len(after['time_changes_mid_measure'])} cambios internos |",
         f"| Idioma compatible | {status(after['language'] in {'es', 'ca', 'en', 'la', 'de'})} | "
@@ -1027,6 +1529,21 @@ def write_report(
             f"- Silabeo entre voces: {problem}." for problem in syllabic_mismatches
         )
         lines.append("")
+    octave_warnings = after["vocal_octave_warnings"]
+    assert isinstance(octave_warnings, list)
+    lines.extend(["## Octavas de tenor y bajo", ""])
+    if octave_warnings:
+        lines.extend(f"- {warning}." for warning in octave_warnings)
+        lines.extend(
+            [
+                "",
+                "El preparador normaliza la identidad vocal del instrumento, pero no transpone "
+                "notas cuando la clave o la tesitura no permiten decidir la octava con certeza.",
+                "",
+            ]
+        )
+    else:
+        lines.extend(["No se detectaron claves vocales graves sospechosas.", ""])
     lines.extend(
         [
             "## Partitura bilingüe",
@@ -1102,6 +1619,17 @@ def main() -> None:
             "Found D.C., D.S., Coda, Segno or Fine navigation; unfold that "
             "route manually before using this script"
         )
+    swing_measures = (
+        0
+        if args.no_swing
+        else convert_marked_swing(root, force=args.force_swing)
+    )
+    ghost_removed = 0
+    hidden_revealed = 0
+    if not args.no_ghost_fixes:
+        ghost_removed, hidden_revealed = repair_hidden_rests(root)
+    tenor_octaves_repaired = repair_tenor_octave(root)
+    tempo_added = ensure_initial_tempo(root, 100)
     reference_measures = parts[0].findall("measure")
     playback = build_playback_order(reference_measures)
     max_verse = max(
@@ -1116,6 +1644,12 @@ def main() -> None:
         )
 
     stats = rewrite_parts(root, playback)
+    stats.swing_measures_converted = swing_measures
+    stats.default_tempo_added = tempo_added
+    stats.ghost_rests_removed = ghost_removed
+    stats.hidden_rests_revealed = hidden_revealed
+    stats.tenor_octaves_repaired = tenor_octaves_repaired
+    stats.dangling_ties_removed = repair_dangling_ties(root)
     if bilingual_config:
         rows = phonetic_candidates(root, bilingual_config)
         stats.phonetic_candidates = len(rows)
@@ -1131,6 +1665,7 @@ def main() -> None:
             stats.phonetic_converted = apply_confirmed_phonetics(
                 root, args.apply_phonetics
             )
+    stats.vocal_parts_normalized = normalize_vocal_parts(root)
     encoding = root.find("identification/encoding")
     if encoding is not None:
         software = ET.SubElement(encoding, "software")
@@ -1162,6 +1697,11 @@ def main() -> None:
         f"phonetic_candidates={stats.phonetic_candidates} "
         f"phonetic_converted={stats.phonetic_converted} "
         f"phonetic_unresolved={stats.phonetic_unresolved}"
+        f" swing_measures={stats.swing_measures_converted}"
+        f" ghost_rests_removed={stats.ghost_rests_removed}"
+        f" hidden_rests_revealed={stats.hidden_rests_revealed}"
+        f" tenor_octaves_repaired={stats.tenor_octaves_repaired}"
+        f" dangling_ties_removed={stats.dangling_ties_removed}"
     )
     print(f"output={args.output}")
     print(f"report={report_path}")
