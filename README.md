@@ -18,6 +18,7 @@ Quien no quiera utilizar Python ni la línea de comandos puede usar la [aplicaci
 - Compara el silabeo alineado entre las voces y señala diferencias para revisar.
 - Informa nombres de partes, tempo, idioma, divisi, grupos irregulares y notas que podrían sonar con «ah».
 - No modifica automáticamente una letra cuando el resultado es ambiguo.
+- Ofrece un flujo bilingüe optativo con vista previa editable y confirmación individual.
 
 Una sinalefa une en una sola emisión vocal la vocal final de una palabra y la vocal inicial de la siguiente. En este flujo, el guion bajo dentro de la letra —por ejemplo, `y_al`— representa explícitamente esa unión para Cantamus.
 
@@ -56,6 +57,39 @@ El script crea dos archivos:
 
 Si se omite `--report`, el informe se guarda junto a la salida con el sufijo `-report.md`.
 
+## Partituras bilingües
+
+Cantamus utiliza un solo idioma de voz por partitura. Cuando una obra combina, por ejemplo, español e inglés, el preparador puede proponer una escritura fonética aproximada del inglés para una voz configurada en español. Esta función es optativa: primero genera una vista previa y no cambia ninguna sílaba hasta que cada reemplazo haya sido confirmado.
+
+El archivo de configuración JSON declara:
+
+- `primary_language`: idioma elegido para la voz de Cantamus, por ejemplo `es`.
+- `secondary_language`: idioma que necesita transcripción, por ejemplo `en`.
+- `replacements`: diccionario por lote de texto original a fonética aproximada.
+- `passages`: lista opcional de partes y rangos de compases del idioma secundario. Si se omite, el script sólo propone coincidencias exactas del diccionario.
+
+Hay un modelo editable en [`examples/bilingue-en-es.json`](examples/bilingue-en-es.json). Para crear la vista previa:
+
+```bash
+python3 cantamus_optimize.py entrada.musicxml vista-previa.musicxml \
+  --bilingual-config examples/bilingue-en-es.json \
+  --phonetic-preview fonetica.csv \
+  --report vista-previa.md
+```
+
+Abrí `fonetica.csv` con Excel, Numbers o una planilla compatible. Cada fila muestra idioma principal y secundario, voz, compás, nota, verso, texto original, propuesta fonética y estado. Corregí la columna `phonetic` cuando sea necesario y escribí `yes` en `confirmed` únicamente para los reemplazos aprobados.
+
+Para aplicar la revisión:
+
+```bash
+python3 cantamus_optimize.py entrada.musicxml salida-Cantamus.musicxml \
+  --bilingual-config examples/bilingue-en-es.json \
+  --apply-phonetics fonetica.csv \
+  --report auditoria.md
+```
+
+Antes de modificar cada sílaba, el script verifica parte, compás, nota, verso y texto original exacto. Si algo cambió desde la vista previa, se detiene; no intenta adivinar ni altera silenciosamente el idioma principal. Las letras con elisiones nativas o estructuras múltiples se marcan como ambiguas y requieren revisión manual.
+
 ## Límites y revisión final
 
 El script despliega repeticiones secuenciales simples y casillas numeradas. Si encuentra navegación mediante D.C., D.S. o Coda, letras incompatibles con las pasadas disponibles o una estructura circular, se detiene para evitar inventar música o texto.
@@ -70,4 +104,3 @@ Antes de subir el resultado a Cantamus, conviene abrirlo en MuseScore u otro edi
 ## Licencia
 
 Este proyecto se distribuye bajo la [licencia MIT](LICENSE).
-
