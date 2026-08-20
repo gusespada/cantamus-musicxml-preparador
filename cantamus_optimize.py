@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import argparse
 import copy
+import csv
+import json
 import re
 import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
@@ -69,6 +71,9 @@ class TransformStats:
     alternate_lyrics_removed: int = 0
     stanza_prefixes_removed: int = 0
     repeat_markers_removed: int = 0
+    phonetic_candidates: int = 0
+    phonetic_converted: int = 0
+    phonetic_unresolved: int = 0
 
 
 def parse_args() -> argparse.Namespace:
@@ -81,6 +86,24 @@ def parse_args() -> argparse.Namespace:
         "--report",
         type=Path,
         help="Markdown audit report (default: OUTPUT-report.md)",
+    )
+    parser.add_argument(
+        "--bilingual-config",
+        type=Path,
+        help=(
+            "Optional JSON file with primary_language, secondary_language, "
+            "replacements and optional secondary-language passages"
+        ),
+    )
+    parser.add_argument(
+        "--phonetic-preview",
+        type=Path,
+        help="Write an editable CSV preview; no phonetic replacement is applied",
+    )
+    parser.add_argument(
+        "--apply-phonetics",
+        type=Path,
+        help="Apply only rows marked confirmed=yes in a previously reviewed CSV",
     )
     return parser.parse_args()
 
@@ -325,6 +348,210 @@ def displayed_lyric_text(lyric: ET.Element) -> str:
         elif child.tag == "elision":
             value += (child.text or "").strip() or "_"
     return re.sub(r"\s+", " ", value).strip()
+
+
+PHONETIC_FIELDS = (
+    "primary_language",
+    "secondary_language",
+    "part_id",
+    "part",
+    "measure",
+    "note",
+    "verse",
+    "original",
+    "phonetic",
+    "confirmed",
+    "status",
+)
+
+
+def load_bilingual_config(path: Path) -> dict[str, object]:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("Bilingual config must be a JSON object")
+    primary = str(data.get("primary_language", "")).strip().lower()
+    secondary = str(data.get("secondary_language", "")).strip().lower()
+    if not primary or not secondary or primary == secondary:
+        raise ValueError(
+            "Bilingual config needs different primary_language and secondary_language"
+        )
+    replacements = data.get("replacements", {})
+    passages = data.get("passages", [])
+    if not isinstance(replacements, dict) or not all(
+        isinstance(key, str) and isinstance(value, str)
+        for key, value in replacements.items()
+    ):
+        raise ValueError("Bilingual replacements must be a string-to-string object")
+    if not isinstance(passages, list) or not all(
+        isinstance(item, dict) for item in passages
+    ):
+        raise ValueError("Bilingual passages must be a list of objects")
+    return {
+        "primary_language": primary,
+        "secondary_language": secondary,
+        "replacements": {
+            key.strip().casefold(): value.strip()
+            for key, value in replacements.items()
+            if key.strip() and value.strip()
+        },
+        "passages": passages,
+    }
+
+
+def passage_matches(
+    passages: list[dict[str, object]],
+    part_id: str,
+    part_name: str,
+    measure_number: str,
+) -> bool:
+    try:
+        measure = int(measure_number)
+    except ValueError:
+        return False
+    for passage in passages:
+        wanted_part = str(passage.get("part", "*")).strip().casefold()
+        if wanted_part not in {"", "*", part_id.casefold(), part_name.casefold()}:
+            continue
+        start = int(passage.get("measure_start", passage.get("measure", measure)))
+        end = int(passage.get("measure_end", passage.get("measure", start)))
+        if start <= measure <= end:
+            return True
+    return False
+
+
+def phonetic_candidates(
+    root: ET.Element,
+    config: dict[str, object],
+) -> list[dict[str, str]]:
+    names = part_name_map(root)
+    replacements = config["replacements"]
+    passages = config["passages"]
+    assert isinstance(replacements, dict) and isinstance(passages, list)
+    rows: list[dict[str, str]] = []
+    for part in root.findall("part"):
+        part_id = part.get("id", "")
+        part_name = names.get(part_id, part_id or "Parte")
+        for measure in part.findall("measure"):
+            measure_number = measure.get("number", "?")
+            marked = passage_matches(passages, part_id, part_name, measure_number)
+            for note_index, note in enumerate(measure.findall("note"), start=1):
+                for lyric in note.findall("lyric"):
+                    original = displayed_lyric_text(lyric)
+                    suggested = str(replacements.get(original.casefold(), ""))
+                    if not marked and not suggested:
+                        continue
+                    text_elements = lyric.findall("text")
+                    native_elisions = lyric.findall("elision")
+                    if len(text_elements) != 1 or native_elisions:
+                        status = "ambiguous_structure"
+                        suggested = ""
+                    elif suggested:
+                        status = "suggested"
+                    else:
+                        status = "unresolved"
+                    rows.append(
+                        {
+                            "primary_language": str(config["primary_language"]),
+                            "secondary_language": str(config["secondary_language"]),
+                            "part_id": part_id,
+                            "part": part_name,
+                            "measure": measure_number,
+                            "note": str(note_index),
+                            "verse": str(lyric_verse(lyric)),
+                            "original": original,
+                            "phonetic": suggested,
+                            "confirmed": "no",
+                            "status": status,
+                        }
+                    )
+    return rows
+
+
+def write_phonetic_preview(path: Path, rows: list[dict[str, str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8-sig", newline="") as output:
+        writer = csv.DictWriter(output, fieldnames=PHONETIC_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def confirmed_value(value: str) -> bool:
+    return value.strip().casefold() in {"yes", "y", "true", "1", "si", "sí"}
+
+
+def apply_confirmed_phonetics(root: ET.Element, path: Path) -> int:
+    names = part_name_map(root)
+    parts = {part.get("id", ""): part for part in root.findall("part")}
+    converted = 0
+    with path.open(encoding="utf-8-sig", newline="") as source:
+        reader = csv.DictReader(source)
+        missing = set(PHONETIC_FIELDS) - set(reader.fieldnames or [])
+        if missing:
+            raise ValueError(
+                "Phonetic CSV is missing columns: " + ", ".join(sorted(missing))
+            )
+        for line_number, row in enumerate(reader, start=2):
+            if not confirmed_value(row["confirmed"]):
+                continue
+            part_id = row["part_id"]
+            part = parts.get(part_id)
+            if part is None or names.get(part_id, part_id) != row["part"]:
+                raise ValueError(f"Phonetic CSV line {line_number}: part mismatch")
+            measure = next(
+                (
+                    candidate
+                    for candidate in part.findall("measure")
+                    if candidate.get("number", "?") == row["measure"]
+                ),
+                None,
+            )
+            if measure is None:
+                raise ValueError(f"Phonetic CSV line {line_number}: measure not found")
+            notes = measure.findall("note")
+            note_index = int(row["note"])
+            if note_index < 1 or note_index > len(notes):
+                raise ValueError(f"Phonetic CSV line {line_number}: note not found")
+            lyrics = [
+                lyric
+                for lyric in notes[note_index - 1].findall("lyric")
+                if lyric_verse(lyric) == int(row["verse"])
+            ]
+            if len(lyrics) != 1:
+                raise ValueError(
+                    f"Phonetic CSV line {line_number}: lyric is missing or ambiguous"
+                )
+            lyric = lyrics[0]
+            current = displayed_lyric_text(lyric)
+            if current != row["original"]:
+                raise ValueError(
+                    f"Phonetic CSV line {line_number}: found {current!r}, "
+                    f"expected {row['original']!r}"
+                )
+            text_elements = lyric.findall("text")
+            if len(text_elements) != 1 or lyric.findall("elision"):
+                raise ValueError(
+                    f"Phonetic CSV line {line_number}: lyric structure is ambiguous"
+                )
+            replacement = row["phonetic"].strip()
+            if not replacement:
+                raise ValueError(
+                    f"Phonetic CSV line {line_number}: confirmed replacement is empty"
+                )
+            text_elements[0].text = replacement
+            converted += 1
+    return converted
+
+
+def set_primary_lyric_language(root: ET.Element, language: str) -> None:
+    defaults = root.find("defaults")
+    if defaults is None:
+        defaults = ET.Element("defaults")
+        insertion = 1 if root.find("work") is not None else 0
+        root.insert(insertion, defaults)
+    lyric_language = defaults.find("lyric-language")
+    if lyric_language is None:
+        lyric_language = ET.SubElement(defaults, "lyric-language")
+    lyric_language.set("{http://www.w3.org/XML/1998/namespace}lang", language)
 
 
 def analyze_elisions(
@@ -700,6 +927,7 @@ def write_report(
     after: dict[str, object],
     playback: list[PlaybackMeasure],
     stats: TransformStats,
+    bilingual_config: dict[str, object] | None = None,
 ) -> None:
     before_parts = before["parts"]
     after_parts = after["parts"]
@@ -722,6 +950,8 @@ def write_report(
         f"- Letras alternativas eliminadas después de asignarlas a su pasada: {stats.alternate_lyrics_removed}.",
         f"- Letras duplicadas con el mismo identificador eliminadas: {stats.duplicate_lyrics_removed}.",
         f"- Prefijos de estrofa retirados (por ejemplo, `2.`): {stats.stanza_prefixes_removed}.",
+        f"- Reemplazos fonéticos confirmados: {stats.phonetic_converted}.",
+        f"- Candidatos fonéticos sin resolver o con estructura ambigua: {stats.phonetic_unresolved}.",
         "- Los guiones bajos se conservaron: Cantamus los admite como elisión.",
         "",
         "## Comprobación contra la guía",
@@ -799,6 +1029,21 @@ def write_report(
         lines.append("")
     lines.extend(
         [
+            "## Partitura bilingüe",
+            "",
+            (
+                f"Idioma de la voz de Cantamus: `{bilingual_config['primary_language']}`; "
+                f"idioma secundario: `{bilingual_config['secondary_language']}`. "
+                f"Se aplicaron {stats.phonetic_converted} reemplazos confirmados y "
+                f"quedaron {stats.phonetic_unresolved} candidatos sin resolver."
+                if bilingual_config
+                else "No se solicitó conversión fonética bilingüe."
+            ),
+            "",
+            "La conversión fonética es aproximada y optativa. El script sólo cambia filas "
+            "marcadas como confirmadas y comprueba el texto original antes de escribirlas; "
+            "si la partitura ya no coincide, se detiene sin aplicar silenciosamente el caso incierto.",
+            "",
             "## Uso del script",
             "",
             "```bash",
@@ -834,6 +1079,15 @@ def write_musicxml(tree: ET.ElementTree, destination: Path) -> None:
 
 def main() -> None:
     args = parse_args()
+    if (args.phonetic_preview or args.apply_phonetics) and not args.bilingual_config:
+        raise ValueError(
+            "--phonetic-preview and --apply-phonetics require --bilingual-config"
+        )
+    bilingual_config = (
+        load_bilingual_config(args.bilingual_config)
+        if args.bilingual_config
+        else None
+    )
     report_path = args.report or args.output.with_name(args.output.stem + "-report.md")
     tree = parse_tree(args.input)
     root = tree.getroot()
@@ -862,6 +1116,21 @@ def main() -> None:
         )
 
     stats = rewrite_parts(root, playback)
+    if bilingual_config:
+        rows = phonetic_candidates(root, bilingual_config)
+        stats.phonetic_candidates = len(rows)
+        stats.phonetic_unresolved = sum(
+            row["status"] != "suggested" for row in rows
+        )
+        set_primary_lyric_language(
+            root, str(bilingual_config["primary_language"])
+        )
+        if args.phonetic_preview:
+            write_phonetic_preview(args.phonetic_preview, rows)
+        if args.apply_phonetics:
+            stats.phonetic_converted = apply_confirmed_phonetics(
+                root, args.apply_phonetics
+            )
     encoding = root.find("identification/encoding")
     if encoding is not None:
         software = ET.SubElement(encoding, "software")
@@ -874,13 +1143,25 @@ def main() -> None:
         raise ValueError("Multiple simultaneous lyrics remain after optimization")
 
     write_musicxml(tree, args.output)
-    write_report(report_path, args.input, args.output, before, after, playback, stats)
+    write_report(
+        report_path,
+        args.input,
+        args.output,
+        before,
+        after,
+        playback,
+        stats,
+        bilingual_config,
+    )
     print(
         f"parts={len(parts)} measures_before={len(reference_measures)} "
         f"measures_after={len(playback)} repeats_after={after['repeat_count']} "
         f"multi_lyric_notes_after={sum(row['multiple_lyric_notes'] for row in after['parts'])} "
         f"elisions={after['elision_count']} "
-        f"elision_issues={len(after['malformed_elisions']) + len(after['syllabic_mismatches'])}"
+        f"elision_issues={len(after['malformed_elisions']) + len(after['syllabic_mismatches'])} "
+        f"phonetic_candidates={stats.phonetic_candidates} "
+        f"phonetic_converted={stats.phonetic_converted} "
+        f"phonetic_unresolved={stats.phonetic_unresolved}"
     )
     print(f"output={args.output}")
     print(f"report={report_path}")

@@ -1,0 +1,27 @@
+{
+  "primary_language": "es",
+  "secondary_language": "en",
+  "replacements": {
+    "we": "ui",
+    "gave": "gueiv",
+    "her": "jer",
+    "most": "moust",
+    "of": "ov",
+    "our": "auer",
+    "life": "laif",
+    "she's": "shis",
+    "home": "joum",
+    "wednes": "uens",
+    "day": "dei",
+    "five": "faiv",
+    "clock": "cloc",
+    "years": "iers"
+  },
+  "passages": [
+    {
+      "part": "soprano",
+      "measure_start": 2,
+      "measure_end": 10
+    }
+  ]
+}
